@@ -1,1 +1,1 @@
-# btc-whale-dectector
+# btc-whale-detector
