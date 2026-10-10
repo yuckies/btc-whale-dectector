@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTC Whale Detector</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#0d111b;color:white;font-family:Arial,sans-serif;max-width:850px;margin-inline:auto}
+h1{color:#bb91ff;font-size:26px;margin-bottom:5px}
+.subtitle,.note{color:#aaa;font-size:13px;line-height:1.6}
+.card{background:#191f30;border:1px solid #30384c;border-radius:12px;padding:16px;margin-top:16px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:15px 0}
+.row span:first-child{min-width:0}
+.row strong{text-align:right}
+.green{color:#00e69a}
+.red{color:#ff536b}
+.purple{color:#bb91ff}
+input{width:85px;padding:9px;background:#101725;color:white;border:1px solid #69718a;border-radius:6px;font-size:16px}
+.trade{padding:12px 0;border-bottom:1px solid #343b4c;line-height:1.7;overflow-wrap:anywhere}
+.trade small{color:#aaa}
+#trades{max-height:420px;overflow-y:auto}
+.status{font-weight:bold}
+.muted{color:#aaa}
+</style>
+</head>
+<body>
+<h1>🐋 BTC Whale Detector</h1>
+<div class="subtitle">Live Bitcoin Trades • Coinbase BTC-USD</div>
+
+<div class="card">
+  <div class="row">
+    <span>Connection</span>
+    <span id="status" class="status purple">Connecting...</span>
+  </div>
+  <div class="row">
+    <span>Minimum Trade Size</span>
+    <span>
+      <input
+        id="threshold"
+        type="number"
+        value="0.5"
+        min="0.00000001"
+        step="any"
+        inputmode="decimal"
+        aria-label="Minimum BTC trade size"
+      > BTC
+    </span>
+  </div>
+</div>
+
+<div class="card">
+<h3>📊 15-Minute Session</h3>
+<div class="row">
+  <span>Time Remaining</span>
+  <strong id="timer">--:--</strong>
+</div>
+<div class="row green">
+  <span>Aggressive Buys</span>
+  <strong id="buyVolume">0 BTC</strong>
+</div>
+<div class="row red">
+  <span>Aggressive Sells</span>
+  <strong id="sellVolume">0 BTC</strong>
+</div>
+<div class="row">
+  <span>Buy Pressure</span>
+  <strong id="buyPercent">0%</strong>
+</div>
+<div class="row">
+  <span>Sell Pressure</span>
+  <strong id="sellPercent">0%</strong>
+</div>
+<div class="row">
+  <span>Market Pressure</span>
+  <strong id="pressure">WAITING</strong>
+</div>
+</div>
+
+<div class="card">
+  <h3>🐋 Large Trade Alerts</h3>
+  <div id="trades" aria-live="polite">
+    Waiting for qualifying trades...
+  </div>
+</div>
+
+<div class="card note">
+  Trades are reported by Coinbase Advanced Trade's public
+  BTC-USD market-trades feed. BUY and SELL represent
+  Coinbase-reported trade sides; neither guarantees future
+  price direction. Session totals cover only trades received
+  while this page is connected. Alerts show individual
+  reported executions, not necessarily whole orders.
+  Keep the page open for updates.
+</div>
+
+<script>
+"use strict";
+
+const statusEl = document.getElementById("status");
+const tradesEl = document.getElementById("trades");
+const thresholdEl = document.getElementById("threshold");
+
+let socket = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+
+let buyVolume = 0;
+let sellVolume = 0;
+let currentSession = Math.floor(Date.now() / 900000);
+
+const seenTrades = new Set();
+
+const sessionOf = t => Math.floor(t / 900000);
+const formatBTC = n => n.toFixed(8);
+
+function threshold() {
+  const n = Number(thresholdEl.value);
+  return thresholdEl.value.trim() !== "" &&
+    Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function waitingText() {
+  const t = threshold();
+  tradesEl.textContent = t === null
+    ? "Enter a minimum trade size greater than zero."
+    : "Waiting for trades of at least " + t + " BTC...";
+}
+
+thresholdEl.addEventListener("input", waitingText);
+
+function resetSession() {
+  buyVolume = 0;
+  sellVolume = 0;
+  updateDashboard();
+}
+
+function updateTimer() {
+  const now = Date.now();
+  const remaining = 900000 - (now % 900000);
+
+  document.getElementById("timer").textContent =
+    String(Math.floor(remaining / 60000)).padStart(2, "0") +
+    ":" +
+    String(Math.floor(remaining % 60000 / 1000)).padStart(2, "0");
+
+  const s = sessionOf(now);
+
+  if (s !== currentSession) {
+    currentSession = s;
+    resetSession();
+    waitingText();
+  }
+}
+
+function updateDashboard() {
+  const total = buyVolume + sellVolume;
+
+  const bp = total > 0 ? buyVolume / total * 100 : 0;
+  const sp = total > 0 ? sellVolume / total * 100 : 0;
+
+  document.getElementById("buyVolume").textContent =
+    formatBTC(buyVolume) + " BTC";
+
+  document.getElementById("sellVolume").textContent =
+    formatBTC(sellVolume) + " BTC";
+
+  document.getElementById("buyPercent").textContent =
+    bp.toFixed(1) + "%";
+
+  document.getElementById("sellPercent").textContent =
+    sp.toFixed(1) + "%";
+
+  const el = document.getElementById("pressure");
+
+  el.textContent =
+    total === 0 ? "WAITING" :
+    bp > 55 ? "BUYERS" :
+    sp > 55 ? "SELLERS" :
+    "BALANCED";
+
+  el.className =
+    total === 0 ? "" :
+    bp > 55 ? "green" :
+    sp > 55 ? "red" :
+    "purple";
+}
+
+function addTrade(side, size, price, time) {
+  const min = threshold();
+
+  if (min === null || size < min) return;
+
+  if (!tradesEl.querySelector(".trade")) {
+    tradesEl.replaceChildren();
+  }
+
+  const div = document.createElement("div");
+  div.className = "trade";
+
+  const label = document.createElement("strong");
+  label.className = side === "BUY" ? "green" : "red";
+  label.textContent = side === "BUY" ? "🟢 BUY" : "🔴 SELL";
+
+  const detail = document.createElement("div");
+  detail.textContent =
+    formatBTC(size) +
+    " BTC @ $" +
+    price.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+
+  const stamp = document.createElement("small");
+  stamp.textContent = new Date(time).toLocaleTimeString();
+
+  div.append(label, detail, stamp);
+  tradesEl.prepend(div);
+
+  while (tradesEl.children.length > 50) {
+    tradesEl.lastElementChild.remove();
+  }
+}
+
+function setStatus(label, cls) {
+  statusEl.textContent = label;
+  statusEl.className = "status " + cls;
+}
+
+function connect() {
+  clearTimeout(reconnectTimer);
+
+  setStatus("Connecting...", "purple");
+
+  const ws = new WebSocket(
+    "wss://advanced-trade-ws.coinbase.com"
+  );
+
+  socket = ws;
+
+  ws.onopen = () => {
+    if (socket !== ws) return;
+
+    setStatus("CONNECTED", "green");
+    reconnectDelay = 1000;
+
+    ws.send(JSON.stringify({
+      type: "subscribe",
+      channel: "market_trades",
+      product_ids: ["BTC-USD"]
+    }));
+
+    ws.send(JSON.stringify({
+      type: "subscribe",
+      channel: "heartbeats",
+      product_ids: ["BTC-USD"]
+    }));
+  };
+
+  ws.onmessage = event => {
+    let message;
+
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (message.channel !== "market_trades") return;
+
+    for (const batch of message.events || []) {
+      for (const trade of batch.trades || []) {
+        if (trade.product_id !== "BTC-USD") continue;
+
+        const size = Number(trade.size);
+        const price = Number(trade.price);
+        const time = Date.parse(trade.time);
+        const side = trade.side;
+
+        if (
+          !Number.isFinite(size) ||
+          size <= 0 ||
+          !Number.isFinite(price) ||
+          price <= 0 ||
+          !Number.isFinite(time) ||
+          (side !== "BUY" && side !== "SELL")
+        ) {
+          continue;
+        }
+
+        if (sessionOf(time) !== sessionOf(Date.now())) {
+          continue;
+        }
+
+        const id = trade.trade_id != null
+          ? String(trade.trade_id)
+          : null;
+
+        if (id !== null && seenTrades.has(id)) {
+          continue;
+        }
+
+        if (id !== null) {
+          seenTrades.add(id);
+
+          if (seenTrades.size > 20000) {
+            seenTrades.clear();
+          }
+        }
+
+        const s = sessionOf(time);
+
+        if (s !== currentSession) {
+          currentSession = s;
+          resetSession();
+          waitingText();
+        }
+
+        if (side === "BUY") {
+          buyVolume += size;
+        } else {
+          sellVolume += size;
+        }
+
+        addTrade(side, size, price, time);
+        updateDashboard();
+      }
+    }
+  };
+
+  ws.onerror = () => {
+    if (socket === ws) {
+      setStatus("CONNECTION ERROR", "red");
+    }
+  };
+
+  ws.onclose = () => {
+    if (socket !== ws) return;
+
+    setStatus("RECONNECTING", "red");
+
+    reconnectTimer = setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+  };
+}
+
+updateTimer();
+updateDashboard();
+waitingText();
+
+setInterval(updateTimer, 1000);
+connect();
+</script>
+</body>
+</html>
